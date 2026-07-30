@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no, maximum-scale=1.0">
-    <title>Heightmap Deformation Prototype</title>
+    <title>Dynamic Terrain Deformation Shader Prototype</title>
     <style>
         body { margin: 0; overflow: hidden; background: #87ceeb; touch-action: none; font-family: sans-serif; }
         canvas { display: block; }
@@ -24,11 +24,15 @@
         #btn-raise { right: 20px; bottom: 85px; }
         #btn-lower { right: 20px; bottom: 20px; }
         
-        /* Invisible dual-joystick zones */
+        /* Dual-zone touch controls */
         #zone-move { position: absolute; bottom: 0; left: 0; width: 50%; height: 100%; pointer-events: auto; z-index: 5; }
         #zone-look { position: absolute; top: 0; right: 0; width: 50%; height: 100%; pointer-events: auto; z-index: 5; }
         
-        .instructions { position: absolute; bottom: 25px; left: 20px; color: rgba(255,255,255,0.7); font-size: 14px; pointer-events: none; text-shadow: 1px 1px 2px black; }
+        .instructions { 
+            position: absolute; bottom: 25px; left: 20px; 
+            color: rgba(255,255,255,0.85); font-size: 14px; 
+            pointer-events: none; text-shadow: 1px 1px 3px black; 
+        }
     </style>
 </head>
 <body>
@@ -38,44 +42,183 @@
         <div id="zone-look"></div>
         <button id="btn-raise" class="btn">Raise Terrain</button>
         <button id="btn-lower" class="btn">Lower Terrain</button>
-        <div class="instructions">Left Side: Move &nbsp;|&nbsp; Right Side: Look</div>
+        <div class="instructions">Left: Move &nbsp;|&nbsp; Right: Look</div>
     </div>
 
     <script type="module">
         import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
+        import { createNoise2D } from 'https://cdn.jsdelivr.net/npm/simplex-noise@4.0.1/+esm';
+
+        // Initialize Simplex Generator
+        const noise2D = createNoise2D();
 
         // 1. Scene & Camera Setup
         const scene = new THREE.Scene();
-        scene.fog = new THREE.FogExp2(0x87ceeb, 0.02);
+        scene.fog = new THREE.FogExp2(0x87ceeb, 0.012);
 
         const camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
         const playerHeight = 2.5;
-        camera.position.set(0, playerHeight, 5);
+        camera.position.set(0, 50, 0);
 
         const renderer = new THREE.WebGLRenderer({ antialias: true });
         renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.shadowMap.enabled = true;
         document.body.appendChild(renderer.domElement);
 
         // 2. Lighting
-        const light = new THREE.DirectionalLight(0xffffff, 1.2);
-        light.position.set(20, 50, 20);
-        scene.add(light);
-        scene.add(new THREE.AmbientLight(0x404040));
+        const sun = new THREE.DirectionalLight(0xffffff, 1.2);
+        sun.position.set(40, 80, 20);
+        sun.castShadow = true;
+        scene.add(sun);
+        scene.add(new THREE.AmbientLight(0x505050));
 
-        // 3. The 2.5D Terrain Mesh
-        const size = 100;
-        const segments = 100;
-        const geometry = new THREE.PlaneGeometry(size, size, segments, segments);
-        geometry.rotateX(-Math.PI / 2); // Lay flat on XZ axis
+        // 3. Helper to Generate Procedural Canvas Textures (Zero external image dependencies)
+        function createNoiseTexture(colorA, colorB) {
+            const canvas = document.createElement('canvas');
+            canvas.width = canvas.height = 256;
+            const ctx = canvas.getContext('2d');
+            
+            ctx.fillStyle = colorA;
+            ctx.fillRect(0, 0, 256, 256);
+            
+            for (let i = 0; i < 9000; i++) {
+                ctx.fillStyle = colorB;
+                ctx.globalAlpha = Math.random() * 0.25;
+                const x = Math.random() * 256;
+                const y = Math.random() * 256;
+                ctx.fillRect(x, y, 2, 2);
+            }
+            
+            const texture = new THREE.CanvasTexture(canvas);
+            texture.wrapS = THREE.RepeatWrapping;
+            texture.wrapT = THREE.RepeatWrapping;
+            return texture;
+        }
 
-        const material = new THREE.MeshStandardMaterial({ 
-            color: 0x3d8c40, 
-            wireframe: true // Kept true so you can easily see the vertex deformation
+        const grassTex = createNoiseTexture('#488b49', '#2d5a2e'); // Green
+        const dirtTex  = createNoiseTexture('#7c5d36', '#4a361e'); // Brown
+        const rockTex  = createNoiseTexture('#6e706e', '#3a3b3a'); // Grey
+
+        // 4. Custom GLSL Blending Material via onBeforeCompile
+        const terrainMaterial = new THREE.MeshStandardMaterial({
+            roughness: 0.8,
+            metalness: 0.1,
+            flatShading: false
         });
-        const terrain = new THREE.Mesh(geometry, material);
+
+        const terrainUniforms = {
+            uGrassTex: { value: grassTex },
+            uDirtTex:  { value: dirtTex },
+            uRockTex:  { value: rockTex },
+            uTextureScale: { value: 0.12 }
+        };
+
+        terrainMaterial.onBeforeCompile = (shader) => {
+            shader.uniforms.uGrassTex = terrainUniforms.uGrassTex;
+            shader.uniforms.uDirtTex  = terrainUniforms.uDirtTex;
+            shader.uniforms.uRockTex  = terrainUniforms.uRockTex;
+            shader.uniforms.uTextureScale = terrainUniforms.uTextureScale;
+
+            // Pass World Position and Normal from Vertex to Fragment
+            shader.vertexShader = shader.vertexShader.replace(
+                '#include <common>',
+                `
+                #include <common>
+                varying vec3 vWorldPosition;
+                varying vec3 vWorldNormal;
+                `
+            );
+
+            shader.vertexShader = shader.vertexShader.replace(
+                '#include <worldpos_vertex>',
+                `
+                #include <worldpos_vertex>
+                vWorldPosition = (modelMatrix * vec4(transformed, 1.0)).xyz;
+                vWorldNormal = normalize(mat3(modelMatrix) * normal);
+                `
+            );
+
+            // Inject GLSL Blend Logic into Fragment Shader
+            shader.fragmentShader = shader.fragmentShader.replace(
+                '#include <common>',
+                `
+                #include <common>
+                uniform sampler2D uGrassTex;
+                uniform sampler2D uDirtTex;
+                uniform sampler2D uRockTex;
+                uniform float uTextureScale;
+
+                varying vec3 vWorldPosition;
+                varying vec3 vWorldNormal;
+                `
+            );
+
+            shader.fragmentShader = shader.fragmentShader.replace(
+                '#include <map_fragment>',
+                `
+                // 1. Calculate slope (1.0 = completely flat, 0.0 = vertical cliff)
+                float slope = clamp(dot(vWorldNormal, vec3(0.0, 1.0, 0.0)), 0.0, 1.0);
+
+                // Steepness threshold: Below ~45 deg turns to Rock
+                float rockFactor = 1.0 - smoothstep(0.55, 0.75, slope);
+
+                // Elevation threshold: Excavated pits or mountain peaks shift to Dirt
+                float dirtFactor = 1.0 - smoothstep(-3.0, 6.0, vWorldPosition.y);
+
+                // Triplanar XZ coordinates prevent texture stretching
+                vec2 worldUV = vWorldPosition.xz * uTextureScale;
+
+                vec4 grassColor = texture2D(uGrassTex, worldUV);
+                vec4 dirtColor  = texture2D(uDirtTex, worldUV);
+                vec4 rockColor  = texture2D(uRockTex, worldUV);
+
+                // Blend Grass -> Dirt -> Rock
+                vec4 baseSurface = mix(grassColor, dirtColor, dirtFactor * (1.0 - rockFactor));
+                vec4 finalSurface = mix(baseSurface, rockColor, rockFactor);
+
+                diffuseColor = finalSurface;
+                `
+            );
+        };
+
+        // 5. Build 2.5D Heightmap Mesh with Simplex Noise
+        const size = 120;
+        const segments = 120;
+        const geometry = new THREE.PlaneGeometry(size, size, segments, segments);
+        geometry.rotateX(-Math.PI / 2); // Lay flat on XZ plane
+
+        function generateTerrainNoise(geo) {
+            const positions = geo.attributes.position;
+            const octaves = 4;
+            
+            for (let i = 0; i < positions.count; i++) {
+                const x = positions.getX(i);
+                const z = positions.getZ(i);
+
+                let elevation = 0;
+                let frequency = 0.012;
+                let amplitude = 12.0;
+
+                for (let o = 0; o < octaves; o++) {
+                    elevation += noise2D(x * frequency, z * frequency) * amplitude;
+                    frequency *= 2.0;
+                    amplitude *= 0.5;
+                }
+
+                positions.setY(i, elevation);
+            }
+
+            positions.needsUpdate = true;
+            geo.computeVertexNormals();
+        }
+
+        generateTerrainNoise(geometry);
+
+        const terrain = new THREE.Mesh(geometry, terrainMaterial);
+        terrain.receiveShadow = true;
         scene.add(terrain);
 
-        // 4. Raycasting & Deformation Logic
+        // 6. Raycasting & Deformation Mechanics
         const raycaster = new THREE.Raycaster();
         const center = new THREE.Vector2(0, 0);
 
@@ -86,21 +229,20 @@
             if (intersects.length > 0) {
                 const point = intersects[0].point;
                 const positions = geometry.attributes.position;
-                const radius = 3.0; // Brush size
+                const radius = 4.5; // Brush radius
 
                 for (let i = 0; i < positions.count; i++) {
                     const vx = positions.getX(i);
                     const vz = positions.getZ(i);
                     const dist = Math.sqrt((vx - point.x) ** 2 + (vz - point.z) ** 2);
 
-                    // Smooth linear falloff
                     if (dist < radius) {
                         const influence = (1 - dist / radius) * amount;
                         positions.setY(i, positions.getY(i) + influence);
                     }
                 }
                 
-                // Alert the GPU to update the mesh
+                // Recompute normals to trigger GLSL slope texture updates instantly
                 positions.needsUpdate = true;
                 geometry.computeVertexNormals();
                 geometry.computeBoundingBox();
@@ -108,11 +250,10 @@
             }
         }
 
-        // UI Event Listeners
-        document.getElementById('btn-raise').addEventListener('touchstart', (e) => { e.preventDefault(); e.stopPropagation(); modifyTerrain(0.8); });
-        document.getElementById('btn-lower').addEventListener('touchstart', (e) => { e.preventDefault(); e.stopPropagation(); modifyTerrain(-0.8); });
+        document.getElementById('btn-raise').addEventListener('touchstart', (e) => { e.preventDefault(); e.stopPropagation(); modifyTerrain(1.2); });
+        document.getElementById('btn-lower').addEventListener('touchstart', (e) => { e.preventDefault(); e.stopPropagation(); modifyTerrain(-1.2); });
 
-        // 5. Mobile Touch Controls
+        // 7. Mobile Dual-Zone Touch Camera Controls
         let yaw = 0, pitch = 0;
         let moveTouchId = null, lookTouchId = null;
         let moveVector = new THREE.Vector3();
@@ -121,7 +262,7 @@
         const zoneLook = document.getElementById('zone-look');
         const zoneMove = document.getElementById('zone-move');
 
-        // Look Mechanics (Right Side)
+        // Right side: Look
         zoneLook.addEventListener('touchstart', (e) => {
             e.preventDefault();
             const t = e.changedTouches[0];
@@ -137,8 +278,8 @@
                     const dx = t.clientX - parseFloat(zoneLook.dataset.lx);
                     const dy = t.clientY - parseFloat(zoneLook.dataset.ly);
                     
-                    yaw -= dx * 0.006;
-                    pitch -= dy * 0.006;
+                    yaw -= dx * 0.005;
+                    pitch -= dy * 0.005;
                     pitch = Math.max(-Math.PI/2 + 0.1, Math.min(Math.PI/2 - 0.1, pitch));
                     
                     camera.quaternion.setFromEuler(new THREE.Euler(pitch, yaw, 0, 'YXZ'));
@@ -153,7 +294,7 @@
         zoneLook.addEventListener('touchend', resetLook);
         zoneLook.addEventListener('touchcancel', resetLook);
 
-        // Move Mechanics (Left Side)
+        // Left side: Move
         zoneMove.addEventListener('touchstart', (e) => {
             e.preventDefault();
             const t = e.changedTouches[0];
@@ -167,7 +308,7 @@
                 if(t.identifier === moveTouchId) {
                     const dx = t.clientX - moveStart.x;
                     const dy = t.clientY - moveStart.y;
-                    moveVector.set(dx * 0.003, 0, dy * 0.003); // Cap max speed multiplier here
+                    moveVector.set(dx * 0.003, 0, dy * 0.003);
                 }
             }
         });
@@ -176,19 +317,18 @@
             for(let t of e.changedTouches) {
                 if(t.identifier === moveTouchId) {
                     moveTouchId = null;
-                    moveVector.set(0,0,0);
+                    moveVector.set(0, 0, 0);
                 }
             }
         };
         zoneMove.addEventListener('touchend', resetMove);
         zoneMove.addEventListener('touchcancel', resetMove);
 
-        // 6. Game Loop & Physics
+        // 8. Main Loop & Player Height Snapping
         function animate() {
             requestAnimationFrame(animate);
             
             if (moveTouchId !== null) {
-                // Calculate movement relative to camera's forward/right orientation
                 const forward = new THREE.Vector3(0, 0, -1).applyAxisAngle(new THREE.Vector3(0, 1, 0), yaw);
                 const right = new THREE.Vector3(1, 0, 0).applyAxisAngle(new THREE.Vector3(0, 1, 0), yaw);
                 
@@ -196,7 +336,7 @@
                 camera.position.addScaledVector(forward, -moveVector.z);
             }
 
-            // Snap player vertically to the deformed terrain height
+            // Raycast vertically downwards to stay glued to terrain height
             raycaster.set(new THREE.Vector3(camera.position.x, 200, camera.position.z), new THREE.Vector3(0, -1, 0));
             const hits = raycaster.intersectObject(terrain);
             if (hits.length > 0) {
@@ -207,7 +347,6 @@
         }
         animate();
 
-        // Responsive scaling
         window.addEventListener('resize', () => {
             camera.aspect = window.innerWidth / window.innerHeight;
             camera.updateProjectionMatrix();
