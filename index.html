@@ -1,0 +1,218 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no, maximum-scale=1.0">
+    <title>Heightmap Deformation Prototype</title>
+    <style>
+        body { margin: 0; overflow: hidden; background: #87ceeb; touch-action: none; font-family: sans-serif; }
+        canvas { display: block; }
+        
+        #ui { position: absolute; top: 0; left: 0; width: 100%; height: 100%; pointer-events: none; z-index: 10; }
+        
+        #crosshair {
+            position: absolute; top: 50%; left: 50%; width: 10px; height: 10px;
+            background: rgba(255, 50, 50, 0.8); transform: translate(-50%, -50%);
+            border-radius: 50%; border: 2px solid white; box-shadow: 0 0 4px black;
+        }
+        
+        .btn {
+            pointer-events: auto; position: absolute; padding: 15px 25px;
+            background: rgba(0, 0, 0, 0.6); color: white; border: 1px solid white;
+            border-radius: 8px; font-weight: bold; user-select: none; z-index: 20;
+        }
+        #btn-raise { right: 20px; bottom: 85px; }
+        #btn-lower { right: 20px; bottom: 20px; }
+        
+        /* Invisible dual-joystick zones */
+        #zone-move { position: absolute; bottom: 0; left: 0; width: 50%; height: 100%; pointer-events: auto; z-index: 5; }
+        #zone-look { position: absolute; top: 0; right: 0; width: 50%; height: 100%; pointer-events: auto; z-index: 5; }
+        
+        .instructions { position: absolute; bottom: 25px; left: 20px; color: rgba(255,255,255,0.7); font-size: 14px; pointer-events: none; text-shadow: 1px 1px 2px black; }
+    </style>
+</head>
+<body>
+    <div id="ui">
+        <div id="crosshair"></div>
+        <div id="zone-move"></div>
+        <div id="zone-look"></div>
+        <button id="btn-raise" class="btn">Raise Terrain</button>
+        <button id="btn-lower" class="btn">Lower Terrain</button>
+        <div class="instructions">Left Side: Move &nbsp;|&nbsp; Right Side: Look</div>
+    </div>
+
+    <script type="module">
+        import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
+
+        // 1. Scene & Camera Setup
+        const scene = new THREE.Scene();
+        scene.fog = new THREE.FogExp2(0x87ceeb, 0.02);
+
+        const camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+        const playerHeight = 2.5;
+        camera.position.set(0, playerHeight, 5);
+
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        document.body.appendChild(renderer.domElement);
+
+        // 2. Lighting
+        const light = new THREE.DirectionalLight(0xffffff, 1.2);
+        light.position.set(20, 50, 20);
+        scene.add(light);
+        scene.add(new THREE.AmbientLight(0x404040));
+
+        // 3. The 2.5D Terrain Mesh
+        const size = 100;
+        const segments = 100;
+        const geometry = new THREE.PlaneGeometry(size, size, segments, segments);
+        geometry.rotateX(-Math.PI / 2); // Lay flat on XZ axis
+
+        const material = new THREE.MeshStandardMaterial({ 
+            color: 0x3d8c40, 
+            wireframe: true // Kept true so you can easily see the vertex deformation
+        });
+        const terrain = new THREE.Mesh(geometry, material);
+        scene.add(terrain);
+
+        // 4. Raycasting & Deformation Logic
+        const raycaster = new THREE.Raycaster();
+        const center = new THREE.Vector2(0, 0);
+
+        function modifyTerrain(amount) {
+            raycaster.setFromCamera(center, camera);
+            const intersects = raycaster.intersectObject(terrain);
+            
+            if (intersects.length > 0) {
+                const point = intersects[0].point;
+                const positions = geometry.attributes.position;
+                const radius = 3.0; // Brush size
+
+                for (let i = 0; i < positions.count; i++) {
+                    const vx = positions.getX(i);
+                    const vz = positions.getZ(i);
+                    const dist = Math.sqrt((vx - point.x) ** 2 + (vz - point.z) ** 2);
+
+                    // Smooth linear falloff
+                    if (dist < radius) {
+                        const influence = (1 - dist / radius) * amount;
+                        positions.setY(i, positions.getY(i) + influence);
+                    }
+                }
+                
+                // Alert the GPU to update the mesh
+                positions.needsUpdate = true;
+                geometry.computeVertexNormals();
+                geometry.computeBoundingBox();
+                geometry.computeBoundingSphere();
+            }
+        }
+
+        // UI Event Listeners
+        document.getElementById('btn-raise').addEventListener('touchstart', (e) => { e.preventDefault(); e.stopPropagation(); modifyTerrain(0.8); });
+        document.getElementById('btn-lower').addEventListener('touchstart', (e) => { e.preventDefault(); e.stopPropagation(); modifyTerrain(-0.8); });
+
+        // 5. Mobile Touch Controls
+        let yaw = 0, pitch = 0;
+        let moveTouchId = null, lookTouchId = null;
+        let moveVector = new THREE.Vector3();
+        let moveStart = { x: 0, y: 0 };
+
+        const zoneLook = document.getElementById('zone-look');
+        const zoneMove = document.getElementById('zone-move');
+
+        // Look Mechanics (Right Side)
+        zoneLook.addEventListener('touchstart', (e) => {
+            e.preventDefault();
+            const t = e.changedTouches[0];
+            lookTouchId = t.identifier;
+            zoneLook.dataset.lx = t.clientX;
+            zoneLook.dataset.ly = t.clientY;
+        });
+
+        zoneLook.addEventListener('touchmove', (e) => {
+            e.preventDefault();
+            for(let t of e.changedTouches) {
+                if(t.identifier === lookTouchId) {
+                    const dx = t.clientX - parseFloat(zoneLook.dataset.lx);
+                    const dy = t.clientY - parseFloat(zoneLook.dataset.ly);
+                    
+                    yaw -= dx * 0.006;
+                    pitch -= dy * 0.006;
+                    pitch = Math.max(-Math.PI/2 + 0.1, Math.min(Math.PI/2 - 0.1, pitch));
+                    
+                    camera.quaternion.setFromEuler(new THREE.Euler(pitch, yaw, 0, 'YXZ'));
+                    
+                    zoneLook.dataset.lx = t.clientX;
+                    zoneLook.dataset.ly = t.clientY;
+                }
+            }
+        });
+
+        const resetLook = (e) => { for(let t of e.changedTouches) if(t.identifier === lookTouchId) lookTouchId = null; };
+        zoneLook.addEventListener('touchend', resetLook);
+        zoneLook.addEventListener('touchcancel', resetLook);
+
+        // Move Mechanics (Left Side)
+        zoneMove.addEventListener('touchstart', (e) => {
+            e.preventDefault();
+            const t = e.changedTouches[0];
+            moveTouchId = t.identifier;
+            moveStart = { x: t.clientX, y: t.clientY };
+        });
+
+        zoneMove.addEventListener('touchmove', (e) => {
+            e.preventDefault();
+            for(let t of e.changedTouches) {
+                if(t.identifier === moveTouchId) {
+                    const dx = t.clientX - moveStart.x;
+                    const dy = t.clientY - moveStart.y;
+                    moveVector.set(dx * 0.003, 0, dy * 0.003); // Cap max speed multiplier here
+                }
+            }
+        });
+
+        const resetMove = (e) => {
+            for(let t of e.changedTouches) {
+                if(t.identifier === moveTouchId) {
+                    moveTouchId = null;
+                    moveVector.set(0,0,0);
+                }
+            }
+        };
+        zoneMove.addEventListener('touchend', resetMove);
+        zoneMove.addEventListener('touchcancel', resetMove);
+
+        // 6. Game Loop & Physics
+        function animate() {
+            requestAnimationFrame(animate);
+            
+            if (moveTouchId !== null) {
+                // Calculate movement relative to camera's forward/right orientation
+                const forward = new THREE.Vector3(0, 0, -1).applyAxisAngle(new THREE.Vector3(0, 1, 0), yaw);
+                const right = new THREE.Vector3(1, 0, 0).applyAxisAngle(new THREE.Vector3(0, 1, 0), yaw);
+                
+                camera.position.addScaledVector(right, moveVector.x);
+                camera.position.addScaledVector(forward, -moveVector.z);
+            }
+
+            // Snap player vertically to the deformed terrain height
+            raycaster.set(new THREE.Vector3(camera.position.x, 200, camera.position.z), new THREE.Vector3(0, -1, 0));
+            const hits = raycaster.intersectObject(terrain);
+            if (hits.length > 0) {
+                camera.position.y = hits[0].point.y + playerHeight;
+            }
+            
+            renderer.render(scene, camera);
+        }
+        animate();
+
+        // Responsive scaling
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+    </script>
+</body>
+</html>
